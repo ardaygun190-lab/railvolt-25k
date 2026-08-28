@@ -15,9 +15,9 @@ import {
   PowerOff, 
   FastForward,
   LocateFixed,
-  Sliders,
   FileText,
-  Layers
+  Layers,
+  CheckCircle2
 } from 'lucide-react';
 
 interface Station {
@@ -39,13 +39,13 @@ interface YHTRoute {
 interface TrainModel {
   id: string;
   name: string;
-  massTon: number;          // Toplam Tren Kütlesi (Ton)
-  maxPowerMw: number;       // Maksimum İnverter Gücü
-  maxSpeedKmh: number;      // Maksimum İşletme Hızı
-  davisA: number;           // Yuvarlanma direnci katsayısı (kN)
-  davisB: number;           // Mekanik direnç katsayısı (kN / (km/h))
-  davisC: number;           // Aerodinamik direnç katsayısı (kN / (km/h)^2)
-  efficiency: number;       // Drivetrain verimi (%90)
+  massTon: number;
+  maxPowerMw: number;
+  maxSpeedKmh: number;
+  davisA: number;
+  davisB: number;
+  davisC: number;
+  efficiency: number;
 }
 
 const TCDD_FLEET: TrainModel[] = [
@@ -134,7 +134,6 @@ export default function App() {
   const [selectedRouteId, setSelectedRouteId] = useState('ist-ankara');
   const [selectedTrainId, setSelectedTrainId] = useState('siemens-ht80000');
 
-  // Hat & BESS Kontrolleri
   const [waysideBessActive, setWaysideBessActive] = useState(true);
   const [substationFailed, setSubstationFailed] = useState(false);
   const [dualTrainActive, setDualTrainActive] = useState(true);
@@ -142,16 +141,13 @@ export default function App() {
   const route = YHT_ROUTES.find((r) => r.id === selectedRouteId)!;
   const train = TCDD_FLEET.find((t) => t.id === selectedTrainId)!;
 
-  // Tren 1 (Ana Tren)
-  const [train1Km, setTrain1Km] = useState(220); // Varsayılan Bilecik rampası civarı
+  const [train1Km, setTrain1Km] = useState(220);
   const [train1Speed, setTrain1Speed] = useState(250);
   const [train1DelaySec, setTrain1DelaySec] = useState(0);
 
-  // Tren 2 (Karşı Yönden Gelen Tren)
   const [train2Km, setTrain2Km] = useState(270);
   const [train2Speed] = useState(230);
 
-  // BESS 3.0 MWh / 4.0 MW Parametreleri
   const [bessSoc, setBessSoc] = useState(82);
   const [bessPowerKw, setBessPowerKw] = useState(0);
 
@@ -160,7 +156,6 @@ export default function App() {
     setTrain1Speed(train.maxSpeedKmh);
   }, [selectedRouteId, selectedTrainId]);
 
-  // Mevcut İstasyon ve Eğim Tespiti
   const currentStationIndex = route.stations.findIndex((s, idx) => {
     const nextS = route.stations[idx + 1];
     return nextS ? (train1Km >= s.km && train1Km < nextS.km) : true;
@@ -168,28 +163,21 @@ export default function App() {
   const currentStation = route.stations[currentStationIndex] || route.stations[0];
   const currentGradePermille = currentStation.gradePermille || 0;
 
-  // --- 1. DAVIS DENKLEMİ VE CER DİNAMİĞİ HESAPLAMASI ---
+  // Cer Dinamiği Hesaplaması
   const vKmh = Math.max(10, train1Speed);
   const vMs = vKmh / 3.6;
   
-  // Davis Direnci: F_res = A + B*v + C*v^2 (kN)
   const fDavisKn = train.davisA + (train.davisB * vKmh) + (train.davisC * Math.pow(vKmh, 2));
-  
-  // Rampa Eğim Direnci: F_grad = m * g * sin(theta) ~ m * g * (i / 1000) (kN)
   const fGradeKn = train.massTon * 9.81 * (currentGradePermille / 1000);
-  
-  // İvmelenme Kuvveti (Hedef hıza ulaşmak için dinamik çekiş talebi)
   const isAccelerating = train1Speed < train.maxSpeedKmh;
-  const targetAccMs2 = isAccelerating ? 0.25 : 0.02; // m/s^2
-  const fAccKn = train.massTon * 1.08 * targetAccMs2; // %8 dönen kütle eylemsizlik katsayısı
+  const targetAccMs2 = isAccelerating ? 0.25 : 0.02;
+  const fAccKn = train.massTon * 1.08 * targetAccMs2;
 
   const fTotalKn = Math.max(5, fDavisKn + fGradeKn + fAccKn);
-  
-  // Tekerlek Gücü ve Katenerden Talep Edilen Elektriksel Güç (MW)
   const pWheelMw = (fTotalKn * vMs) / 1000;
   const rawDemandedPowerMw = Math.min(train.maxPowerMw, parseFloat((pWheelMw / train.efficiency).toFixed(2)));
 
-  // --- 2. 25 kV AC KATENER GERİLİM ÇÖKÜŞÜ (ÇİFT TARAFLI & N-1 TOPOLOJİSİ) ---
+  // Trafo & Empedans Mesafesi
   const substations = route.stations.filter(s => s.hasSubstation);
   let distToNearestTm = 35;
   if (substations.length > 0) {
@@ -200,17 +188,15 @@ export default function App() {
     distToNearestTm = Math.min(...distances);
   }
 
-  // Hat Empedansı (Ray Geri Dönüş Devresi Dahil Loop Empedansı ~0.28 Ohm/km)
   const zLoopPerKm = 0.28;
   const nominalCurrentA = (rawDemandedPowerMw * 1000) / (25.0 * 0.98);
   let catenaryDropKv = (nominalCurrentA * (distToNearestTm * zLoopPerKm)) / 1000;
 
-  // Çift Tren Yük Akışı Etkisi (Tren 2 de aynı besleme bölgesindeyse)
   if (dualTrainActive && Math.abs(train2Km - train1Km) < 50) {
     catenaryDropKv += 1.65;
   }
 
-  // --- 3. WAYSIDE BESS (PCS DROOP KONTROL & ENJEKSİYON) ---
+  // Wayside BESS
   let bessInjectedVoltageKv = 0;
   let dynamicBessPowerKw = 0;
   const distToBess = Math.abs(train1Km - route.bessKm);
@@ -218,11 +204,9 @@ export default function App() {
   if (waysideBessActive && bessSoc > 8 && distToBess < 35) {
     const estimatedVoltageWithoutBess = 27.5 - catenaryDropKv;
     if (estimatedVoltageWithoutBess < 22.5) {
-      // Droop Voltaj Kontrolü
       const voltageDeficit = 22.5 - estimatedVoltageWithoutBess;
       const proximityFactor = Math.max(0, (35 - distToBess) / 35);
       
-      // PCS 4.0 MW Inverter Güç Sınırı
       dynamicBessPowerKw = Math.min(4000, Math.round(voltageDeficit * 1200 * proximityFactor));
       bessInjectedVoltageKv = parseFloat(((dynamicBessPowerKw / 4000) * 3.8 * proximityFactor).toFixed(2));
     }
@@ -230,7 +214,7 @@ export default function App() {
 
   const pantoVoltageKv = Math.min(27.5, Math.max(14.0, parseFloat((27.5 - catenaryDropKv + bessInjectedVoltageKv).toFixed(2))));
 
-  // --- 4. EN 50163 STANDARDI TCU GÜÇ KISMA (DERATING) KARAKTERİSTİĞİ ---
+  // EN 50163 TCU Karakteristiği
   let deratingRatio = 1.0;
   let deratingStatus: 'NOMINAL' | 'LINEAR_DERATE' | 'CRITICAL_DERATE' | 'CB_TRIP' = 'NOMINAL';
 
@@ -238,15 +222,12 @@ export default function App() {
     deratingRatio = 1.0;
     deratingStatus = 'NOMINAL';
   } else if (pantoVoltageKv >= 19.0) {
-    // 19.0 kV - 22.5 kV arası doğrusal güç kısıtı
     deratingRatio = pantoVoltageKv / 22.5;
     deratingStatus = 'LINEAR_DERATE';
   } else if (pantoVoltageKv >= 17.5) {
-    // 17.5 kV - 19.0 kV arası kritik geçici bölge (%38 sabit acil çekiş)
     deratingRatio = 0.38;
     deratingStatus = 'CRITICAL_DERATE';
   } else {
-    // 17.5 kV altı: EN 50163 ana kesici açma
     deratingRatio = 0.0;
     deratingStatus = 'CB_TRIP';
   }
@@ -254,7 +235,6 @@ export default function App() {
   const actualTractionPowerMw = parseFloat((rawDemandedPowerMw * deratingRatio).toFixed(2));
   const activeCurrentAmps = pantoVoltageKv > 0 ? Math.round((actualTractionPowerMw * 1000) / (pantoVoltageKv * 0.98)) : 0;
 
-  // Zaman Döngüsü
   useEffect(() => {
     if (!isRunning) return;
 
@@ -284,12 +264,10 @@ export default function App() {
         });
       }
 
-      // 210 km/s altına inildiğinde rötar sayacı
       if (train1Speed < (train.maxSpeedKmh - 40)) {
         setTrain1DelaySec((prev) => prev + Math.round(((train.maxSpeedKmh - train1Speed) / 20) * (simSpeed * 0.4)));
       }
 
-      // BESS SoC Güncellemesi (3000 kWh kapasite)
       if (dynamicBessPowerKw > 0) {
         setBessPowerKw(dynamicBessPowerKw);
         setBessSoc((prev) => Math.max(5, parseFloat((prev - (dynamicBessPowerKw / 3000) * 0.005 * simSpeed).toFixed(2))));
@@ -321,11 +299,11 @@ export default function App() {
                   RailVolt 25k Pro
                 </h1>
                 <span className="px-2.5 py-0.5 rounded text-xs bg-red-500/20 text-red-300 font-mono font-bold border border-red-500/30">
-                  v2.0 CER GÜÇ AKIŞI
+                  CER GÜÇ SİMÜLASYONU
                 </span>
               </div>
               <p className="text-xs md:text-sm text-slate-400 mt-0.5">
-                EN 50163 Standardı, Davis Cer Direnci, TCU Güç Kısıtı ve Ray Kenarı BESS Modeli
+                EN 50163 Standardı, Rampa Cer Güç Dinamiği ve Ray Kenarı BESS Modeli
               </p>
             </div>
           </div>
@@ -347,7 +325,7 @@ export default function App() {
                   activeTab === 'assumptions' ? 'bg-cyan-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                <FileText className="w-3.5 h-3.5" /> Mühendislik Kabulleri
+                <FileText className="w-3.5 h-3.5" /> Standartlar & Metodoloji
               </button>
             </div>
 
@@ -413,7 +391,7 @@ export default function App() {
 
               <div>
                 <label className="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5 mb-1.5">
-                  <Train className="w-3.5 h-3.5 text-cyan-400" /> Tren Seti & Kütle
+                  <Train className="w-3.5 h-3.5 text-cyan-400" /> Tren Seti
                 </label>
                 <select
                   value={selectedTrainId}
@@ -421,7 +399,7 @@ export default function App() {
                   className="w-full bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-2 text-xs font-bold text-slate-200 focus:outline-none focus:border-cyan-500"
                 >
                   {TCDD_FLEET.map((t) => (
-                    <option key={t.id} value={t.id}>{t.name} ({t.massTon} t)</option>
+                    <option key={t.id} value={t.id}>{t.name} ({t.massTon} ton)</option>
                   ))}
                 </select>
               </div>
@@ -533,7 +511,6 @@ export default function App() {
 
             {/* 4 ANA METRİK KARTI */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-              {/* Pantograf Gerilimi */}
               <div className={`p-5 rounded-2xl border transition-all ${
                 pantoVoltageKv < 19.0 ? 'bg-red-950/30 border-red-500/60' : 'bg-slate-900/80 border-slate-800'
               }`}>
@@ -555,7 +532,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Cer Gücü & Davis Denklemi */}
               <div className="p-5 rounded-2xl bg-slate-900/80 border border-slate-800">
                 <div className="flex items-center justify-between mb-3 text-xs uppercase text-slate-400 font-bold">
                   <span>Aktif Cer Gücü (TCU)</span>
@@ -573,7 +549,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Hız & Davis Dinamiği */}
               <div className="p-5 rounded-2xl bg-slate-900/80 border border-slate-800">
                 <div className="flex items-center justify-between mb-3 text-xs uppercase text-slate-400 font-bold">
                   <span>YHT Seyir Hızı</span>
@@ -591,7 +566,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* BESS & Rötar Durumu */}
               <div className={`p-5 rounded-2xl border ${
                 train1DelaySec > 0 ? 'bg-amber-950/20 border-amber-500/50' : 'bg-slate-900/80 border-slate-800'
               }`}>
@@ -614,7 +588,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* 25 KV AC KATENER GERİLİM PROFİLİ GRAFİĞİ */}
+            {/* KATENER VOLTAJ GRAFİĞİ */}
             <div className="p-6 rounded-2xl bg-slate-900/90 border border-slate-800 shadow-xl">
               <div className="flex justify-between items-center mb-4 pb-3 border-b border-slate-800">
                 <div>
@@ -631,19 +605,15 @@ export default function App() {
 
               <div className="w-full bg-slate-950 rounded-xl p-4 border border-slate-800">
                 <svg viewBox="0 0 600 140" className="w-full h-44 overflow-visible">
-                  {/* 27.5 kV Nominal */}
                   <line x1="20" y1="18" x2="580" y2="18" stroke="#10b981" strokeWidth="1" strokeDasharray="3 3" opacity="0.4" />
                   <text x="25" y="15" fill="#10b981" fontSize="8" fontFamily="monospace">27.5 kV Maksimum Besleme</text>
 
-                  {/* 19.0 kV Sürekli Minimum Sınır */}
                   <line x1="20" y1="96" x2="580" y2="96" stroke="#ef4444" strokeWidth="1.5" strokeDasharray="3 3" />
                   <text x="25" y="93" fill="#ef4444" fontSize="8" fontFamily="monospace">19.0 kV EN 50163 Sürekli Alt Sınır</text>
 
-                  {/* 17.5 kV Geçici Alt Sınır */}
                   <line x1="20" y1="110" x2="580" y2="110" stroke="#b91c1c" strokeWidth="1" strokeDasharray="2 2" opacity="0.7" />
                   <text x="25" y="120" fill="#b91c1c" fontSize="7" fontFamily="monospace">17.5 kV Kesici Açma Eşiği (Trip)</text>
 
-                  {/* Tren 1 İbresi */}
                   <circle cx={train1SvgX} cy={train1SvgY} r="8" className="fill-red-400/30 animate-ping" />
                   <circle cx={train1SvgX} cy={train1SvgY} r="5" className="fill-red-400 stroke-slate-950 stroke-2" />
 
@@ -668,7 +638,6 @@ export default function App() {
                     Tren 1 ({train1Km} km) • {pantoVoltageKv} kV
                   </text>
 
-                  {/* Tren 2 İbresi */}
                   {dualTrainActive && (
                     <g transform={`translate(${(train2Km / route.totalKm) * 560 + 20}, 45)`}>
                       <circle cx="0" cy="0" r="4" fill="#a855f7" />
@@ -678,7 +647,6 @@ export default function App() {
                     </g>
                   )}
 
-                  {/* BESS Noktası */}
                   <g transform={`translate(${20 + (route.bessKm / route.totalKm) * 560}, 15)`}>
                     <circle cx="0" cy="5" r="4" fill={waysideBessActive ? '#10b981' : '#64748b'} />
                     <text x="0" y="-3" fill="#10b981" fontSize="7" textAnchor="middle" fontWeight="bold">
@@ -690,82 +658,79 @@ export default function App() {
             </div>
           </>
         ) : (
-          /* MÜHENDİSLİK KABULLERİ VE MODEL FORMÜLASYONU SEKMESİ */
+          /* FORMÜLSÜZ, NET VE KURUMSAL METODOLOJİ PANELİ */
           <div className="p-6 rounded-2xl bg-slate-900 border border-slate-800 space-y-6">
             <div>
               <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2">
                 <FileText className="w-5 h-5 text-cyan-400" />
-                RailVolt 25k Matematiksel Modeli & Mühendislik Kabulleri
+                Simülasyon Metodolojisi ve Standartlar
               </h2>
               <p className="text-xs text-slate-400 mt-1">
-                Bu simülasyon aşağıdaki uluslararası standartlar, fizik denklemleri ve elektriksel kabuller çerçevesinde çalışır.
+                RailVolt 25k, uluslararası demiryolu normları ve gerçek cer işletme dinamikleri dikkate alınarak geliştirilmiştir.
               </p>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {/* 1. Cer Dinamiği */}
-              <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
-                <h3 className="text-sm font-bold text-cyan-300 flex items-center gap-1.5">
-                  <Sliders className="w-4 h-4" /> 1. Cer Dinamiği & Davis Denklemi
-                </h3>
-                <p className="text-xs text-slate-300 leading-relaxed">
-                  Tren hareket direnci; yuvarlanma, mekanik kayıplar ve aerodinamik sürtünmeyi içeren standart Davis formülüyle modellenmiştir:
-                </p>
-                <div className="p-2.5 bg-slate-900 rounded font-mono text-xs text-amber-300">
-                  F_total = A + B·v + C·v² + m·g·sin(θ) + m·(1+λ)·a
+              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                <div className="flex items-center gap-2 text-cyan-300 font-bold text-sm">
+                  <CheckCircle2 className="w-4 h-4 text-cyan-400" />
+                  1. Cer Gücü ve Hat Direnç Modeli
                 </div>
-                <ul className="text-[11px] text-slate-400 space-y-1 list-disc pl-4">
-                  <li><strong>Siemens Velaro TR (HT80000):</strong> m = 460 ton, A = 3.2 kN, B = 0.035, C = 0.00135</li>
-                  <li><strong>CAF HT65000:</strong> m = 330 ton, A = 2.6 kN, B = 0.028, C = 0.00118</li>
-                  <li>Drivetrain elektriksel/mekanik verimi: η = %90</li>
-                </ul>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  Trenin katenerden çektiği anlık elektriksel güç sabit kabul edilmez. Tren ağırlığı, anlık seyir hızı, aerodinamik hava sürtünmesi ve güzergahın eğim profili (tırmanma/iniş) dinamik olarak hesaba katılır.
+                </p>
+                <div className="text-[11px] text-slate-400 space-y-1">
+                  <div>• <strong>Siemens Velaro TR (HT80000):</strong> 460 ton servis ağırlığı, 8.0 MW inverter kapasitesi.</div>
+                  <div>• <strong>CAF HT65000:</strong> 330 ton servis ağırlığı, 4.8 MW inverter kapasitesi.</div>
+                </div>
               </div>
 
               {/* 2. EN 50163 Standardı */}
-              <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
-                <h3 className="text-sm font-bold text-cyan-300 flex items-center gap-1.5">
-                  <ShieldCheck className="w-4 h-4" /> 2. EN 50163 Gerilim & TCU Derating
-                </h3>
-                <p className="text-xs text-slate-300 leading-relaxed">
-                  25 kV 50 Hz AC elektrifikasyon sistemlerinde pantograf gerilim sınırları ve TCU güç kısıt davranışı:
-                </p>
-                <ul className="text-[11px] text-slate-400 space-y-1.5">
-                  <li><strong className="text-emerald-400">V ≥ 22.5 kV:</strong> Nominal işletme, %100 cer gücü çekişi.</li>
-                  <li><strong className="text-amber-400">19.0 kV ≤ V &lt; 22.5 kV:</strong> Doğrusal güç kısıtı (P = P_talep · V / 22.5).</li>
-                  <li><strong className="text-red-400">17.5 kV ≤ V &lt; 19.0 kV:</strong> Kritik geçici bölge, TCU gücü %38'e kilitler.</li>
-                  <li><strong className="text-red-500">V &lt; 17.5 kV:</strong> EN 50163 alt sınır ihlali; ana kesici açar (0 MW).</li>
-                </ul>
-              </div>
-
-              {/* 3. Besleme Topolojisi & Hat Empedansı */}
-              <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
-                <h3 className="text-sm font-bold text-cyan-300 flex items-center gap-1.5">
-                  <Activity className="w-4 h-4" /> 3. Hat Empedansı & Geri Dönüş Devresi
-                </h3>
-                <p className="text-xs text-slate-300 leading-relaxed">
-                  Katener besleme hattı, toprak ve ray geri dönüş devresi (rail return path) empedansı eşdeğer olarak modellenmiştir:
-                </p>
-                <div className="p-2.5 bg-slate-900 rounded font-mono text-xs text-amber-300">
-                  Z_loop = (R_katener + R_ray) + j·ω·(L_katener + L_ray - 2·M) ≈ 0.28 Ω/km
+              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                <div className="flex items-center gap-2 text-cyan-300 font-bold text-sm">
+                  <CheckCircle2 className="w-4 h-4 text-cyan-400" />
+                  2. EN 50163 / IEC 60850 Gerilim Eşikleri
                 </div>
-                <p className="text-[11px] text-slate-400">
-                  Trafo merkezleri arası çift taraflı paralel besleme ve N-1 trafo arızası senaryolarında eşdeğer empedans dinamik olarak hesaplanır.
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  25 kV AC 50 Hz sistemlerde pantograf gerilim seviyesine göre Cer Kontrol Ünitesi (TCU) şu koruma kademelerini işletir:
                 </p>
+                <div className="text-[11px] space-y-1.5">
+                  <div className="text-emerald-400">• <strong>22.5 kV ve Üzeri:</strong> Nominal işletme, tam çekiş gücü izni (%100).</div>
+                  <div className="text-amber-400">• <strong>19.0 kV – 22.5 kV:</strong> Trafo doymasını önlemek için doğrusal güç kısma.</div>
+                  <div className="text-red-400">• <strong>17.5 kV – 19.0 kV:</strong> Kritik geçici bölge, tren gücü acil olarak %38 seviyesine kilitlenir.</div>
+                  <div className="text-red-500 font-semibold">• <strong>17.5 kV Altı:</strong> Sürekli gerilim ihlali nedeniyle ana devre kesici (Vacuum Circuit Breaker) açar.</div>
+                </div>
               </div>
 
-              {/* 4. Wayside BESS Modeli */}
-              <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
-                <h3 className="text-sm font-bold text-cyan-300 flex items-center gap-1.5">
-                  <Battery className="w-4 h-4" /> 4. Ray Kenarı BESS & PCS Droop Kontrolü
-                </h3>
+              {/* 3. Hat Empedansı & Besleme */}
+              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                <div className="flex items-center gap-2 text-cyan-300 font-bold text-sm">
+                  <CheckCircle2 className="w-4 h-4 text-cyan-400" />
+                  3. Katener Besleme & Ray Geri Dönüş Hattı
+                </div>
                 <p className="text-xs text-slate-300 leading-relaxed">
-                  Rampa ortasına entegre edilen ray kenarı batarya depolama sistemi:
+                  Gerilim düşümü; trafo merkezleri arası elektriksel mesafe, katener iletkeni ve ray geri dönüş devresinin toplam hat empedansı üzerinden hesaplanır.
                 </p>
-                <ul className="text-[11px] text-slate-400 space-y-1 list-disc pl-4">
-                  <li><strong>Kapasite:</strong> 3.0 MWh LiFePO4 / 4.0 MVA PCS Evirici</li>
-                  <li><strong>Kontrol Mantığı:</strong> Katener gerilimi 22.5 kV altına düştüğünde gerilim farkıyla orantılı aktif güç enjeksiyonu (Voltage Droop Control).</li>
-                  <li><strong>SoC Sınırları:</strong> %10 minimum, %95 maksimum güvenlik bandı.</li>
-                </ul>
+                <div className="text-[11px] text-slate-400 space-y-1">
+                  <div>• Trafo merkezleri arası çift yönlü paralel besleme topolojisi.</div>
+                  <div>• <strong>N-1 Arıza Senaryosu:</strong> Bir trafo merkezi devreden çıktığında hat sonundaki kritik voltaj çöküşü.</div>
+                </div>
+              </div>
+
+              {/* 4. Wayside BESS */}
+              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                <div className="flex items-center gap-2 text-cyan-300 font-bold text-sm">
+                  <CheckCircle2 className="w-4 h-4 text-cyan-400" />
+                  4. Ray Kenarı Enerji Depolama (Wayside BESS)
+                </div>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  Rampa ortasına konumlandırılan 3.0 MWh batarya ve 4.0 MW PCS (Güç Dönüşüm Sistemi) ünitesi:
+                </p>
+                <div className="text-[11px] text-slate-400 space-y-1">
+                  <div>• Gerilim 22.5 kV altına düştüğünde anında devreye girerek katener hattına aktif voltaj desteği sağlar.</div>
+                  <div>• Güç kısıtını (TCU Derating) engelleyerek dik rampalarda hız kaybını ve sefer rötarlarını önler.</div>
+                </div>
               </div>
             </div>
           </div>
