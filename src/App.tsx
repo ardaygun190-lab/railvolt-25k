@@ -13,18 +13,20 @@ import {
   Train, 
   MapPin, 
   PowerOff, 
-  FastForward,
-  LocateFixed,
-  FileText,
-  Layers,
-  CheckCircle2
+  FastForward, 
+  LocateFixed, 
+  FileText, 
+  Sliders, 
+  RefreshCw,
+  SlidersHorizontal,
+  ArrowDownUp
 } from 'lucide-react';
 
 interface Station {
   name: string;
   km: number;
   hasSubstation?: boolean;
-  gradePermille?: number; // Binde eğim (örn: 22 = %2.2 rampa)
+  gradePermille?: number;
 }
 
 interface YHTRoute {
@@ -99,7 +101,7 @@ const YHT_ROUTES: YHTRoute[] = [
     name: 'Ankara Gar – Kırıkkale – Yozgat – Sivas (405 km)',
     totalKm: 405,
     bessKm: 190,
-    description: 'Elmadağ viyadükleri, tüneller ve uzun trafo besleme aralıklarına sahip etap.',
+    description: 'Elmadağ viyadükleri, tüneller ve uzun besleme bölgelerine sahip etap.',
     stations: [
       { name: 'Ankara Gar', km: 0, hasSubstation: true, gradePermille: 0 },
       { name: 'Kırıkkale', km: 75, hasSubstation: true, gradePermille: 15 },
@@ -128,34 +130,44 @@ const YHT_ROUTES: YHTRoute[] = [
 ];
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'sim' | 'assumptions'>('sim');
+  const [activeTab, setActiveTab] = useState<'sim' | 'bess_config' | 'methodology'>('sim');
   const [isRunning, setIsRunning] = useState(true);
   const [simSpeed, setSimSpeed] = useState(5);
   const [selectedRouteId, setSelectedRouteId] = useState('ist-ankara');
   const [selectedTrainId, setSelectedTrainId] = useState('siemens-ht80000');
 
+  // Hat & N-1 Durumu
   const [waysideBessActive, setWaysideBessActive] = useState(true);
-  const [substationFailed, setSubstationFailed] = useState(false);
+  const [n1ContingencyActive, setN1ContingencyActive] = useState(false);
   const [dualTrainActive, setDualTrainActive] = useState(true);
+
+  // KULLANICI AYARLAYABİLİR BESS PARAMETRELERİ
+  const [bessPcsMaxMw, setBessPcsMaxMw] = useState(4.0); // 1.0 - 8.0 MW
+  const [bessCapacityMwh, setBessCapacityMwh] = useState(3.0); // 1.0 - 10.0 MWh
+  const [bessDroopThresholdKv, setBessDroopThresholdKv] = useState(22.5); // 20.0 - 24.0 kV
 
   const route = YHT_ROUTES.find((r) => r.id === selectedRouteId)!;
   const train = TCDD_FLEET.find((t) => t.id === selectedTrainId)!;
 
+  // Tren 1 (Ana Tren)
   const [train1Km, setTrain1Km] = useState(220);
   const [train1Speed, setTrain1Speed] = useState(250);
   const [train1DelaySec, setTrain1DelaySec] = useState(0);
 
+  // Tren 2 (Karşı Hat)
   const [train2Km, setTrain2Km] = useState(270);
-  const [train2Speed] = useState(230);
+  const [train2Speed] = useState(220);
 
-  const [bessSoc, setBessSoc] = useState(82);
-  const [bessPowerKw, setBessPowerKw] = useState(0);
+  // BESS Dinamik Durumu
+  const [bessSoc, setBessSoc] = useState(85);
+  const [bessInjectedPowerKw, setBessInjectedPowerKw] = useState(0);
 
   useEffect(() => {
     setTrain1DelaySec(0);
     setTrain1Speed(train.maxSpeedKmh);
   }, [selectedRouteId, selectedTrainId]);
 
+  // İstasyon ve Eğim
   const currentStationIndex = route.stations.findIndex((s, idx) => {
     const nextS = route.stations[idx + 1];
     return nextS ? (train1Km >= s.km && train1Km < nextS.km) : true;
@@ -163,78 +175,116 @@ export default function App() {
   const currentStation = route.stations[currentStationIndex] || route.stations[0];
   const currentGradePermille = currentStation.gradePermille || 0;
 
-  // Cer Dinamiği Hesaplaması
-  const vKmh = Math.max(10, train1Speed);
+  // --- 1. DİNAMİK CER & MOMENTUM MODELİ ---
+  const vKmh = Math.max(5, train1Speed);
   const vMs = vKmh / 3.6;
-  
+
+  // Kinetik Enerji: Ek = 0.5 * m * v^2 (GJ)
+  const kineticEnergyGj = parseFloat(((0.5 * train.massTon * 1000 * Math.pow(vMs, 2)) / 1e9).toFixed(2));
+
+  // Davis Direnci (kN)
   const fDavisKn = train.davisA + (train.davisB * vKmh) + (train.davisC * Math.pow(vKmh, 2));
+  
+  // Rampa Eğim Direnci (kN)
   const fGradeKn = train.massTon * 9.81 * (currentGradePermille / 1000);
-  const isAccelerating = train1Speed < train.maxSpeedKmh;
-  const targetAccMs2 = isAccelerating ? 0.25 : 0.02;
+
+  // İvmelenme / Yavaşlama Durumu
+  const isAccelerating = train1Speed < train.maxSpeedKmh - 5;
+  const isBraking = currentGradePermille < -5; // Dik inişte rejeneratif frenleme
+  
+  let targetAccMs2 = 0.02; // Sabit seyir
+  let tractionMode: 'PİK ÇEKİŞ' | 'SABİT SEYİR' | 'SERBEST SÜRÜŞ' | 'REJENERATİF FREN' = 'SABİT SEYİR';
+
+  if (isBraking) {
+    targetAccMs2 = -0.15;
+    tractionMode = 'REJENERATİF FREN';
+  } else if (isAccelerating) {
+    targetAccMs2 = 0.22;
+    tractionMode = 'PİK ÇEKİŞ';
+  }
+
   const fAccKn = train.massTon * 1.08 * targetAccMs2;
+  const fNetTractionKn = fDavisKn + fGradeKn + fAccKn;
 
-  const fTotalKn = Math.max(5, fDavisKn + fGradeKn + fAccKn);
-  const pWheelMw = (fTotalKn * vMs) / 1000;
-  const rawDemandedPowerMw = Math.min(train.maxPowerMw, parseFloat((pWheelMw / train.efficiency).toFixed(2)));
+  // Tekerlek Gücü ve Katener Talep Gücü (MW)
+  let rawDemandedPowerMw = 0;
+  if (fNetTractionKn > 0) {
+    const pMechMw = (fNetTractionKn * vMs) / 1000;
+    rawDemandedPowerMw = Math.min(train.maxPowerMw, parseFloat((pMechMw / train.efficiency).toFixed(2)));
+  } else {
+    // Rejeneratif Güç Geri Basma (Eksi Güç)
+    const pRegenMw = (Math.abs(fNetTractionKn) * vMs * train.efficiency) / 1000;
+    rawDemandedPowerMw = -Math.min(3.5, parseFloat(pRegenMw.toFixed(2)));
+  }
 
-  // Trafo & Empedans Mesafesi
+  // --- 2. N-1 BESLEME TOPOLOJİSİ & EMPEDANS ---
   const substations = route.stations.filter(s => s.hasSubstation);
   let distToNearestTm = 35;
   if (substations.length > 0) {
-    const activeSubstations = substationFailed 
-      ? substations.filter((_, idx) => idx % 2 === 0)
+    const activeSubstations = n1ContingencyActive
+      ? substations.filter((_, idx) => idx % 2 === 0) // Komşu TM üzerinden fider uzatması
       : substations;
     const distances = activeSubstations.map(s => Math.abs(train1Km - s.km));
     distToNearestTm = Math.min(...distances);
   }
 
-  const zLoopPerKm = 0.28;
-  const nominalCurrentA = (rawDemandedPowerMw * 1000) / (25.0 * 0.98);
+  const zLoopPerKm = 0.28; // Ray geri dönüşü dahil eşdeğer hat empedansı (Ohm/km)
+  const nominalCurrentA = Math.abs(rawDemandedPowerMw * 1000) / (25.0 * 0.98);
+  
+  // Pozitif çekiş voltajı düşürür, rejeneratif fren ise voltajı yükseltir
   let catenaryDropKv = (nominalCurrentA * (distToNearestTm * zLoopPerKm)) / 1000;
+  if (rawDemandedPowerMw < 0) catenaryDropKv = -catenaryDropKv * 0.6; // Rejeneratif voltaj toparlama
 
   if (dualTrainActive && Math.abs(train2Km - train1Km) < 50) {
-    catenaryDropKv += 1.65;
+    catenaryDropKv += 1.45;
   }
 
-  // Wayside BESS
-  let bessInjectedVoltageKv = 0;
+  // --- 3. DİNAMİK WAYSIDE BESS REGÜLASYONU (DROOP KONTROL) ---
+  let bessVoltageSupportKv = 0;
   let dynamicBessPowerKw = 0;
   const distToBess = Math.abs(train1Km - route.bessKm);
 
-  if (waysideBessActive && bessSoc > 8 && distToBess < 35) {
-    const estimatedVoltageWithoutBess = 27.5 - catenaryDropKv;
-    if (estimatedVoltageWithoutBess < 22.5) {
-      const voltageDeficit = 22.5 - estimatedVoltageWithoutBess;
-      const proximityFactor = Math.max(0, (35 - distToBess) / 35);
+  if (waysideBessActive && bessSoc > 5 && distToBess < 40) {
+    const vBeforeBess = 27.5 - catenaryDropKv;
+    if (vBeforeBess < bessDroopThresholdKv) {
+      const voltageDeficit = bessDroopThresholdKv - vBeforeBess;
+      const proximityFactor = Math.max(0, (40 - distToBess) / 40);
       
-      dynamicBessPowerKw = Math.min(4000, Math.round(voltageDeficit * 1200 * proximityFactor));
-      bessInjectedVoltageKv = parseFloat(((dynamicBessPowerKw / 4000) * 3.8 * proximityFactor).toFixed(2));
+      const requestedKw = voltageDeficit * 1100 * proximityFactor;
+      dynamicBessPowerKw = Math.min(bessPcsMaxMw * 1000, Math.round(requestedKw));
+      bessVoltageSupportKv = parseFloat(((dynamicBessPowerKw / (bessPcsMaxMw * 1000)) * 3.6 * proximityFactor).toFixed(2));
     }
   }
 
-  const pantoVoltageKv = Math.min(27.5, Math.max(14.0, parseFloat((27.5 - catenaryDropKv + bessInjectedVoltageKv).toFixed(2))));
+  const pantoVoltageKv = Math.min(27.5, Math.max(14.0, parseFloat((27.5 - catenaryDropKv + bessVoltageSupportKv).toFixed(2))));
 
-  // EN 50163 TCU Karakteristiği
+  // --- 4. EN 50163 STANDARDI TCU DERATING KARAKTERİSTİĞİ ---
   let deratingRatio = 1.0;
   let deratingStatus: 'NOMINAL' | 'LINEAR_DERATE' | 'CRITICAL_DERATE' | 'CB_TRIP' = 'NOMINAL';
 
-  if (pantoVoltageKv >= 22.5) {
-    deratingRatio = 1.0;
-    deratingStatus = 'NOMINAL';
-  } else if (pantoVoltageKv >= 19.0) {
-    deratingRatio = pantoVoltageKv / 22.5;
-    deratingStatus = 'LINEAR_DERATE';
-  } else if (pantoVoltageKv >= 17.5) {
-    deratingRatio = 0.38;
-    deratingStatus = 'CRITICAL_DERATE';
-  } else {
-    deratingRatio = 0.0;
-    deratingStatus = 'CB_TRIP';
+  if (rawDemandedPowerMw > 0) {
+    if (pantoVoltageKv >= 22.5) {
+      deratingRatio = 1.0;
+      deratingStatus = 'NOMINAL';
+    } else if (pantoVoltageKv >= 19.0) {
+      deratingRatio = pantoVoltageKv / 22.5;
+      deratingStatus = 'LINEAR_DERATE';
+    } else if (pantoVoltageKv >= 17.5) {
+      deratingRatio = 0.38;
+      deratingStatus = 'CRITICAL_DERATE';
+    } else {
+      deratingRatio = 0.0;
+      deratingStatus = 'CB_TRIP';
+    }
   }
 
-  const actualTractionPowerMw = parseFloat((rawDemandedPowerMw * deratingRatio).toFixed(2));
-  const activeCurrentAmps = pantoVoltageKv > 0 ? Math.round((actualTractionPowerMw * 1000) / (pantoVoltageKv * 0.98)) : 0;
+  const actualTractionPowerMw = rawDemandedPowerMw > 0 
+    ? parseFloat((rawDemandedPowerMw * deratingRatio).toFixed(2))
+    : rawDemandedPowerMw;
 
+  const activeCurrentAmps = pantoVoltageKv > 0 ? Math.round((Math.abs(actualTractionPowerMw) * 1000) / (pantoVoltageKv * 0.98)) : 0;
+
+  // Canlı Döngü
   useEffect(() => {
     if (!isRunning) return;
 
@@ -264,21 +314,22 @@ export default function App() {
         });
       }
 
-      if (train1Speed < (train.maxSpeedKmh - 40)) {
+      if (train1Speed < (train.maxSpeedKmh - 40) && deratingRatio < 1.0) {
         setTrain1DelaySec((prev) => prev + Math.round(((train.maxSpeedKmh - train1Speed) / 20) * (simSpeed * 0.4)));
       }
 
+      // BESS SoC Güncellemesi (Kullanıcı Tanımlı Kapasiteye Göre)
       if (dynamicBessPowerKw > 0) {
-        setBessPowerKw(dynamicBessPowerKw);
-        setBessSoc((prev) => Math.max(5, parseFloat((prev - (dynamicBessPowerKw / 3000) * 0.005 * simSpeed).toFixed(2))));
+        setBessInjectedPowerKw(dynamicBessPowerKw);
+        setBessSoc((prev) => Math.max(5, parseFloat((prev - (dynamicBessPowerKw / (bessCapacityMwh * 1000)) * 0.005 * simSpeed).toFixed(2))));
       } else {
-        setBessPowerKw(0);
+        setBessInjectedPowerKw(0);
         if (bessSoc < 92) setBessSoc((prev) => Math.min(92, parseFloat((prev + 0.015 * simSpeed).toFixed(2))));
       }
     }, 500);
 
     return () => clearInterval(interval);
-  }, [isRunning, train1Speed, deratingStatus, currentGradePermille, dualTrainActive, dynamicBessPowerKw, bessSoc, route.totalKm, train.maxSpeedKmh, simSpeed, train2Speed]);
+  }, [isRunning, train1Speed, deratingStatus, currentGradePermille, dualTrainActive, dynamicBessPowerKw, bessSoc, route.totalKm, train.maxSpeedKmh, simSpeed, train2Speed, deratingRatio, bessCapacityMwh]);
 
   const train1SvgX = (train1Km / route.totalKm) * 560 + 20;
   const train1SvgY = 130 - ((pantoVoltageKv - 14) / 14) * 110;
@@ -299,37 +350,45 @@ export default function App() {
                   RailVolt 25k Pro
                 </h1>
                 <span className="px-2.5 py-0.5 rounded text-xs bg-red-500/20 text-red-300 font-mono font-bold border border-red-500/30">
-                  CER GÜÇ SİMÜLASYONU
+                  CER GÜÇ AKIŞI & BESS SİMÜLATÖRÜ
                 </span>
               </div>
               <p className="text-xs md:text-sm text-slate-400 mt-0.5">
-                EN 50163 Standardı, Rampa Cer Güç Dinamiği ve Ray Kenarı BESS Modeli
+                EN 50163 Standardı, Dinamik Yük Akışı, N-1 Fider Transferi ve Ayarlanabilir BESS Mimarisi
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-3 flex-wrap">
-            {/* Sekme Butonları */}
+            {/* Sekmeler */}
             <div className="flex bg-slate-900 border border-slate-800 rounded-xl p-1">
               <button
                 onClick={() => setActiveTab('sim')}
                 className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all ${
-                  activeTab === 'sim' ? 'bg-cyan-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'
+                  activeTab === 'sim' ? 'bg-cyan-500 text-slate-950 shadow-md' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
                 <Activity className="w-3.5 h-3.5" /> Canlı Simülasyon
               </button>
               <button
-                onClick={() => setActiveTab('assumptions')}
+                onClick={() => setActiveTab('bess_config')}
                 className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all ${
-                  activeTab === 'assumptions' ? 'bg-cyan-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'
+                  activeTab === 'bess_config' ? 'bg-cyan-500 text-slate-950 shadow-md' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                <FileText className="w-3.5 h-3.5" /> Standartlar & Metodoloji
+                <SlidersHorizontal className="w-3.5 h-3.5" /> BESS Konfigürasyonu
+              </button>
+              <button
+                onClick={() => setActiveTab('methodology')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all ${
+                  activeTab === 'methodology' ? 'bg-cyan-500 text-slate-950 shadow-md' : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <FileText className="w-3.5 h-3.5" /> Metodoloji & Standartlar
               </button>
             </div>
 
-            {/* Hız Kontrolü */}
+            {/* Hız */}
             <div className="flex items-center bg-slate-900 border border-slate-800 rounded-xl p-1 gap-1">
               <span className="text-[11px] font-bold text-slate-400 px-2 flex items-center gap-1">
                 <FastForward className="w-3.5 h-3.5 text-cyan-400" />
@@ -370,7 +429,7 @@ export default function App() {
           </div>
         </header>
 
-        {activeTab === 'sim' ? (
+        {activeTab === 'sim' && (
           <>
             {/* KONTROL KONSOLU */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-3 p-4 rounded-2xl bg-slate-900/70 border border-slate-800">
@@ -381,7 +440,7 @@ export default function App() {
                 <select
                   value={selectedRouteId}
                   onChange={(e) => setSelectedRouteId(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-2 text-xs font-bold text-slate-200 focus:outline-none focus:border-red-500"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-2 text-xs font-bold text-slate-200 focus:outline-none focus:border-red-500 cursor-pointer"
                 >
                   {YHT_ROUTES.map((r) => (
                     <option key={r.id} value={r.id}>{r.name}</option>
@@ -396,7 +455,7 @@ export default function App() {
                 <select
                   value={selectedTrainId}
                   onChange={(e) => setSelectedTrainId(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-2 text-xs font-bold text-slate-200 focus:outline-none focus:border-cyan-500"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-2 text-xs font-bold text-slate-200 focus:outline-none focus:border-cyan-500 cursor-pointer"
                 >
                   {TCDD_FLEET.map((t) => (
                     <option key={t.id} value={t.id}>{t.name} ({t.massTon} ton)</option>
@@ -414,7 +473,7 @@ export default function App() {
                   }`}
                 >
                   <Battery className="w-3.5 h-3.5" />
-                  {waysideBessActive ? 'Wayside BESS (4 MW)' : 'BESS: KAPALI'}
+                  {waysideBessActive ? `BESS Aktif (${bessPcsMaxMw} MW PCS)` : 'BESS: KAPALI'}
                 </button>
               </div>
 
@@ -423,40 +482,45 @@ export default function App() {
                   onClick={() => setDualTrainActive(!dualTrainActive)}
                   className={`w-full py-2 px-2.5 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 border transition-all ${
                     dualTrainActive
-                      ? 'bg-purple-600 text-white border-purple-400'
+                      ? 'bg-purple-600 text-white border-purple-400 shadow-md'
                       : 'bg-slate-950 hover:bg-slate-800 text-slate-400 border-slate-800'
                   }`}
                 >
-                  <Layers className="w-3.5 h-3.5" />
-                  {dualTrainActive ? 'Çoklu Tren Modu' : 'Tek Tren'}
+                  <ArrowDownUp className="w-3.5 h-3.5" />
+                  {dualTrainActive ? 'Çoklu Tren Yük Akışı' : 'Tek Tren'}
                 </button>
               </div>
 
               <div className="flex flex-col justify-end">
                 <button
-                  onClick={() => setSubstationFailed(!substationFailed)}
+                  onClick={() => setN1ContingencyActive(!n1ContingencyActive)}
                   className={`w-full py-2 px-2.5 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 border transition-all ${
-                    substationFailed
-                      ? 'bg-red-600 text-white border-red-400 animate-pulse'
+                    n1ContingencyActive
+                      ? 'bg-amber-600 text-white border-amber-400 animate-pulse shadow-md'
                       : 'bg-slate-950 hover:bg-slate-800 text-slate-400 border-slate-800'
                   }`}
                 >
                   <PowerOff className="w-3.5 h-3.5" />
-                  {substationFailed ? 'N-1 KRİZİ (TM Arızalı)' : 'Trafolar: Normal'}
+                  {n1ContingencyActive ? 'N-1 Durumu (Fider Uzatma)' : 'Trafolar: Normal'}
                 </button>
               </div>
             </div>
 
-            {/* HIZLI IŞINLANMA SLIDER */}
+            {/* HIZLI IŞINLANMA & REJİM BİLGİSİ */}
             <div className="p-4 rounded-2xl bg-slate-900/80 border border-slate-800 space-y-2.5">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between flex-wrap gap-2">
                 <span className="text-xs font-bold text-slate-300 flex items-center gap-1.5">
                   <LocateFixed className="w-4 h-4 text-cyan-400" />
-                  Hızlı Konum Değiştir / İstasyona Işınlan:
+                  Hızlı Konum & Güzergah Profili:
                 </span>
-                <span className="text-xs font-mono font-bold text-cyan-300">
-                  {train1Km} km / {route.totalKm} km ({currentStation.name} Etabı • Binde ‰{currentGradePermille} Eğim)
-                </span>
+                <div className="flex items-center gap-3 text-xs font-mono">
+                  <span className="text-cyan-300 font-bold">
+                    Konum: {train1Km} km / {route.totalKm} km ({currentStation.name})
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-slate-800 text-amber-300 font-bold">
+                    Rejim: {tractionMode}
+                  </span>
+                </div>
               </div>
 
               <input
@@ -486,31 +550,22 @@ export default function App() {
               </div>
             </div>
 
-            {/* EN 50163 UYARI BANNERI */}
-            {deratingStatus !== 'NOMINAL' && (
-              <div className={`border-2 rounded-2xl p-4 flex items-center gap-4 animate-pulse ${
-                deratingStatus === 'CB_TRIP' 
-                  ? 'bg-red-950/70 border-red-600 text-red-200' 
-                  : deratingStatus === 'CRITICAL_DERATE'
-                  ? 'bg-red-500/10 border-red-500/60 text-red-300'
-                  : 'bg-amber-500/10 border-amber-500/60 text-amber-300'
-              }`}>
-                <AlertTriangle className="w-8 h-8 shrink-0 text-red-400" />
-                <div>
-                  <h4 className="font-black text-sm md:text-base">
-                    {deratingStatus === 'CB_TRIP' && 'EN 50163 KESİCİ AÇTI: GERİLİM < 17.5 kV!'}
-                    {deratingStatus === 'CRITICAL_DERATE' && `TCU KRİTİK GÜÇ KISMA: GERİLİM ${pantoVoltageKv} kV (< 19.0 kV)`}
-                    {deratingStatus === 'LINEAR_DERATE' && `TCU LİNEER DERATING DEVREDE: GERİLİM ${pantoVoltageKv} kV (< 22.5 kV)`}
-                  </h4>
-                  <p className="text-xs mt-0.5 opacity-90 leading-relaxed">
-                    {currentStation.name} civarında en yakın trafo merkezine olan elektriksel mesafe ({Math.round(distToNearestTm)} km) ve çekilen cer akımı ({activeCurrentAmps} A) nedeniyle hat gerilimi çöktü. Cer gücü <strong>{actualTractionPowerMw} MW</strong> seviyesine sınırlandı.
-                  </p>
+            {/* N-1 BİLGİLENDİRME PANELİ */}
+            {n1ContingencyActive && (
+              <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/40 text-amber-200 text-xs flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <RefreshCw className="w-4 h-4 text-amber-400 shrink-0 animate-spin" />
+                  <span>
+                    <strong>N-1 İşletme Durumu:</strong> TM-2 devre dışı. Nötr bölge ayırıcısı kapatıldı; hat bölümü komşu Trafo Merkezi üzerinden besleniyor (Fider uzatması nedeniyle eşdeğer empedans 2 katına çıktı).
+                  </span>
                 </div>
+                <span className="font-mono text-amber-300 font-bold whitespace-nowrap">TM Mesafesi: {Math.round(distToNearestTm)} km</span>
               </div>
             )}
 
             {/* 4 ANA METRİK KARTI */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+              {/* Gerilim */}
               <div className={`p-5 rounded-2xl border transition-all ${
                 pantoVoltageKv < 19.0 ? 'bg-red-950/30 border-red-500/60' : 'bg-slate-900/80 border-slate-800'
               }`}>
@@ -532,23 +587,27 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Cer Gücü */}
               <div className="p-5 rounded-2xl bg-slate-900/80 border border-slate-800">
                 <div className="flex items-center justify-between mb-3 text-xs uppercase text-slate-400 font-bold">
                   <span>Aktif Cer Gücü (TCU)</span>
                   <Zap className="w-5 h-5 text-amber-400" />
                 </div>
                 <div className="flex items-baseline gap-2">
-                  <span className="text-3xl font-black font-mono text-slate-100">{actualTractionPowerMw}</span>
+                  <span className={`text-3xl font-black font-mono ${actualTractionPowerMw < 0 ? 'text-emerald-400' : 'text-slate-100'}`}>
+                    {actualTractionPowerMw}
+                  </span>
                   <span className="text-sm text-slate-400 font-medium">/ {rawDemandedPowerMw} MW</span>
                 </div>
                 <div className="mt-3 flex justify-between text-xs text-slate-400">
-                  <span>Direnç Kuvveti: <strong>{Math.round(fTotalKn)} kN</strong></span>
+                  <span>Kinetik Enerji: <strong>{kineticEnergyGj} GJ</strong></span>
                   <span className={deratingRatio < 0.6 ? 'text-red-400 font-bold' : 'text-emerald-400 font-bold'}>
                     %{Math.round(deratingRatio * 100)} İzin
                   </span>
                 </div>
               </div>
 
+              {/* Hız & Eğim */}
               <div className="p-5 rounded-2xl bg-slate-900/80 border border-slate-800">
                 <div className="flex items-center justify-between mb-3 text-xs uppercase text-slate-400 font-bold">
                   <span>YHT Seyir Hızı</span>
@@ -562,25 +621,26 @@ export default function App() {
                 </div>
                 <div className="mt-3 text-xs text-slate-400 flex justify-between">
                   <span>Eğim: <strong>‰{currentGradePermille}</strong></span>
-                  <span>Rampa Direnci: <strong>{Math.round(fGradeKn)} kN</strong></span>
+                  <span>Rampa Yükü: <strong>{Math.round(fGradeKn)} kN</strong></span>
                 </div>
               </div>
 
+              {/* BESS Enjeksiyonu */}
               <div className={`p-5 rounded-2xl border ${
                 train1DelaySec > 0 ? 'bg-amber-950/20 border-amber-500/50' : 'bg-slate-900/80 border-slate-800'
               }`}>
                 <div className="flex items-center justify-between mb-3 text-xs uppercase text-slate-400 font-bold">
-                  <span>BESS Telemetrisi / Rötar</span>
-                  <Battery className={`w-5 h-5 ${bessPowerKw > 0 ? 'text-emerald-400 animate-pulse' : 'text-slate-400'}`} />
+                  <span>BESS Aktif Güç Desteği</span>
+                  <Battery className={`w-5 h-5 ${bessInjectedPowerKw > 0 ? 'text-emerald-400 animate-pulse' : 'text-slate-400'}`} />
                 </div>
                 <div className="flex items-baseline gap-2">
                   <span className="text-2xl font-black font-mono text-emerald-400">
-                    {bessPowerKw > 0 ? `${(bessPowerKw / 1000).toFixed(1)} MW` : 'BEKLEMEDE'}
+                    {bessInjectedPowerKw > 0 ? `${(bessInjectedPowerKw / 1000).toFixed(2)} MW` : '0.00 MW'}
                   </span>
                   <span className="text-xs text-slate-400">SoC: %{bessSoc}</span>
                 </div>
                 <div className="mt-3 text-xs text-slate-400 flex justify-between">
-                  <span>Rötar:</span>
+                  <span>Rötar Durumu:</span>
                   <span className={train1DelaySec > 0 ? 'text-amber-400 font-bold' : 'text-emerald-400 font-bold'}>
                     +{Math.floor(train1DelaySec / 60)} dk {train1DelaySec % 60} sn
                   </span>
@@ -599,7 +659,7 @@ export default function App() {
                   <p className="text-xs text-slate-400 mt-0.5">{route.description}</p>
                 </div>
                 <div className="text-xs text-slate-400 font-mono">
-                  Wayside BESS (3 MWh / 4 MW PCS): {route.bessKm}. km
+                  Wayside BESS: {route.bessKm}. km ({bessPcsMaxMw} MW PCS / {bessCapacityMwh} MWh)
                 </div>
               </div>
 
@@ -657,80 +717,119 @@ export default function App() {
               </div>
             </div>
           </>
-        ) : (
-          /* FORMÜLSÜZ, NET VE KURUMSAL METODOLOJİ PANELİ */
+        )}
+
+        {/* 2. SEKME: İNTERAKTİF BESS KONFİGÜRASYONU */}
+        {activeTab === 'bess_config' && (
+          <div className="p-6 rounded-2xl bg-slate-900 border border-slate-800 space-y-6">
+            <div className="border-b border-slate-800 pb-4">
+              <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2">
+                <Sliders className="w-5 h-5 text-cyan-400" />
+                Ray Kenarı BESS (Wayside BESS) Parametre Optimizasyonu
+              </h2>
+              <p className="text-xs text-slate-400 mt-1">
+                Batarya enerji kapasitesi, inverter (PCS) gücü ve gerilim regülasyon eşiklerini dinamik olarak değiştirip cer hattına etkisini gözlemleyin.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              {/* PCS Gücü */}
+              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                <div className="flex justify-between items-center">
+                  <label className="text-xs font-bold text-slate-300">PCS Evirici Gücü (Inverter)</label>
+                  <span className="text-sm font-mono font-bold text-cyan-400">{bessPcsMaxMw} MW</span>
+                </div>
+                <input
+                  type="range"
+                  min="1.0"
+                  max="8.0"
+                  step="0.5"
+                  value={bessPcsMaxMw}
+                  onChange={(e) => setBessPcsMaxMw(Number(e.target.value))}
+                  className="w-full h-2 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                />
+                <p className="text-[11px] text-slate-400">Katener hattına anlık basılabilecek maksimum aktif güç sınırı.</p>
+              </div>
+
+              {/* Batarya Kapasitesi */}
+              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                <div className="flex justify-between items-center">
+                  <label className="text-xs font-bold text-slate-300">Batarya Enerji Kapasitesi</label>
+                  <span className="text-sm font-mono font-bold text-emerald-400">{bessCapacityMwh} MWh</span>
+                </div>
+                <input
+                  type="range"
+                  min="1.0"
+                  max="10.0"
+                  step="0.5"
+                  value={bessCapacityMwh}
+                  onChange={(e) => setBessCapacityMwh(Number(e.target.value))}
+                  className="w-full h-2 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-emerald-400"
+                />
+                <p className="text-[11px] text-slate-400">LiFePO4 batarya paketinin toplam depolama hacmi ve SoC deşarj dayanımı.</p>
+              </div>
+
+              {/* Droop Eşiği */}
+              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                <div className="flex justify-between items-center">
+                  <label className="text-xs font-bold text-slate-300">Droop Regülasyon Başlama Eşiği</label>
+                  <span className="text-sm font-mono font-bold text-amber-400">{bessDroopThresholdKv} kV</span>
+                </div>
+                <input
+                  type="range"
+                  min="20.0"
+                  max="24.5"
+                  step="0.1"
+                  value={bessDroopThresholdKv}
+                  onChange={(e) => setBessDroopThresholdKv(Number(e.target.value))}
+                  className="w-full h-2 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-amber-400"
+                />
+                <p className="text-[11px] text-slate-400">Katener gerilimi bu eşiğin altına indiğinde BESS devreye girerek voltajı destekler.</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 3. SEKME: METODOLOJİ & STANDARTLAR */}
+        {activeTab === 'methodology' && (
           <div className="p-6 rounded-2xl bg-slate-900 border border-slate-800 space-y-6">
             <div>
               <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2">
                 <FileText className="w-5 h-5 text-cyan-400" />
-                Simülasyon Metodolojisi ve Standartlar
+                Simülasyon Metodolojisi ve Normlar
               </h2>
               <p className="text-xs text-slate-400 mt-1">
-                RailVolt 25k, uluslararası demiryolu normları ve gerçek cer işletme dinamikleri dikkate alınarak geliştirilmiştir.
+                Demiryolu elektrifikasyonu ve cer güç akışı hesaplama kabulleri:
               </p>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {/* 1. Cer Dinamiği */}
-              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
-                <div className="flex items-center gap-2 text-cyan-300 font-bold text-sm">
-                  <CheckCircle2 className="w-4 h-4 text-cyan-400" />
-                  1. Cer Gücü ve Hat Direnç Modeli
-                </div>
+              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                <h3 className="text-sm font-bold text-cyan-300">1. Dinamik Cer Dirençleri & Momentum</h3>
                 <p className="text-xs text-slate-300 leading-relaxed">
-                  Trenin katenerden çektiği anlık elektriksel güç sabit kabul edilmez. Tren ağırlığı, anlık seyir hızı, aerodinamik hava sürtünmesi ve güzergahın eğim profili (tırmanma/iniş) dinamik olarak hesaba katılır.
+                  Trenin katenerden çektiği anlık elektriksel güç; anlık hız, ivme, rampa eğimi ve aerodinamik hava sürtünmesi (Davis denklemi) ile hesaplanır. İniş rampalarında rejeneratif frenleme ile hatta enerji geri beslenir.
                 </p>
-                <div className="text-[11px] text-slate-400 space-y-1">
-                  <div>• <strong>Siemens Velaro TR (HT80000):</strong> 460 ton servis ağırlığı, 8.0 MW inverter kapasitesi.</div>
-                  <div>• <strong>CAF HT65000:</strong> 330 ton servis ağırlığı, 4.8 MW inverter kapasitesi.</div>
-                </div>
               </div>
 
-              {/* 2. EN 50163 Standardı */}
-              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
-                <div className="flex items-center gap-2 text-cyan-300 font-bold text-sm">
-                  <CheckCircle2 className="w-4 h-4 text-cyan-400" />
-                  2. EN 50163 / IEC 60850 Gerilim Eşikleri
-                </div>
+              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                <h3 className="text-sm font-bold text-cyan-300">2. EN 50163 Standardı & TCU Derating</h3>
                 <p className="text-xs text-slate-300 leading-relaxed">
-                  25 kV AC 50 Hz sistemlerde pantograf gerilim seviyesine göre Cer Kontrol Ünitesi (TCU) şu koruma kademelerini işletir:
+                  Pantograf gerilimi 22.5 kV altına indiğinde Cer Kontrol Ünitesi (TCU) trafo doymasını önlemek için çekiş gücünü lineer olarak kısar. 19.0 kV altında kritik güç kilidi uygulanır; 17.5 kV altında ana devre kesici (VCB) açar.
                 </p>
-                <div className="text-[11px] space-y-1.5">
-                  <div className="text-emerald-400">• <strong>22.5 kV ve Üzeri:</strong> Nominal işletme, tam çekiş gücü izni (%100).</div>
-                  <div className="text-amber-400">• <strong>19.0 kV – 22.5 kV:</strong> Trafo doymasını önlemek için doğrusal güç kısma.</div>
-                  <div className="text-red-400">• <strong>17.5 kV – 19.0 kV:</strong> Kritik geçici bölge, tren gücü acil olarak %38 seviyesine kilitlenir.</div>
-                  <div className="text-red-500 font-semibold">• <strong>17.5 kV Altı:</strong> Sürekli gerilim ihlali nedeniyle ana devre kesici (Vacuum Circuit Breaker) açar.</div>
-                </div>
               </div>
 
-              {/* 3. Hat Empedansı & Besleme */}
-              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
-                <div className="flex items-center gap-2 text-cyan-300 font-bold text-sm">
-                  <CheckCircle2 className="w-4 h-4 text-cyan-400" />
-                  3. Katener Besleme & Ray Geri Dönüş Hattı
-                </div>
+              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                <h3 className="text-sm font-bold text-cyan-300">3. N-1 Fider Transferi & Empedans</h3>
                 <p className="text-xs text-slate-300 leading-relaxed">
-                  Gerilim düşümü; trafo merkezleri arası elektriksel mesafe, katener iletkeni ve ray geri dönüş devresinin toplam hat empedansı üzerinden hesaplanır.
+                  Trafo Merkezi arızasında nötr bölge kesicisi kapatılarak hat komşu Trafo Merkezi üzerinden beslenir. İki katına çıkan elektriksel besleme mesafesi nedeniyle aşırı gerilim düşümü meydana gelir.
                 </p>
-                <div className="text-[11px] text-slate-400 space-y-1">
-                  <div>• Trafo merkezleri arası çift yönlü paralel besleme topolojisi.</div>
-                  <div>• <strong>N-1 Arıza Senaryosu:</strong> Bir trafo merkezi devreden çıktığında hat sonundaki kritik voltaj çöküşü.</div>
-                </div>
               </div>
 
-              {/* 4. Wayside BESS */}
-              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
-                <div className="flex items-center gap-2 text-cyan-300 font-bold text-sm">
-                  <CheckCircle2 className="w-4 h-4 text-cyan-400" />
-                  4. Ray Kenarı Enerji Depolama (Wayside BESS)
-                </div>
+              <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                <h3 className="text-sm font-bold text-cyan-300">4. Wayside BESS Dinamik Desteği</h3>
                 <p className="text-xs text-slate-300 leading-relaxed">
-                  Rampa ortasına konumlandırılan 3.0 MWh batarya ve 4.0 MW PCS (Güç Dönüşüm Sistemi) ünitesi:
+                  Katener gerilimi belirlenen eşiğin altına indiğinde, ray kenarı batarya depolama sistemi (Wayside BESS) aktif güç enjekte ederek voltajı toparlar ve sefer rötarlarını önler.
                 </p>
-                <div className="text-[11px] text-slate-400 space-y-1">
-                  <div>• Gerilim 22.5 kV altına düştüğünde anında devreye girerek katener hattına aktif voltaj desteği sağlar.</div>
-                  <div>• Güç kısıtını (TCU Derating) engelleyerek dik rampalarda hız kaybını ve sefer rötarlarını önler.</div>
-                </div>
               </div>
             </div>
           </div>
